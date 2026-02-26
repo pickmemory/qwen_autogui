@@ -1,6 +1,7 @@
 import json
 import base64
 import time
+import httpx
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass
@@ -8,7 +9,6 @@ from dataclasses import dataclass
 import mss
 import mss.tools
 import pyautogui
-from openai import OpenAI
 
 
 @dataclass
@@ -24,13 +24,11 @@ class ScreenAgent:
             self.config = json.load(f)
         
         api_config = self.config["api"]
-        self.client = OpenAI(
-            base_url=api_config["base_url"],
-            api_key=api_config["api_key"]
-        )
+        self.base_url = api_config["base_url"]
+        self.api_key = api_config["api_key"]
         self.model = api_config["model"]
-        self.max_tokens = api_config["max_tokens"]
-        self.temperature = api_config["temperature"]
+        self.max_tokens = api_config.get("max_tokens", 4096)
+        self.temperature = api_config.get("temperature", 0.7)
         
         self.max_iterations = self.config["agent"]["max_iterations"]
         self.delay = self.config["agent"]["delay_between_actions"]
@@ -41,11 +39,29 @@ class ScreenAgent:
         self.conversation_history: List[Dict[str, Any]] = []
     
     def capture_screen(self) -> str:
-        """截取屏幕并返回 base64 编码的图片"""
+        """截取屏幕并返回 base64 编码的图片（压缩后）"""
+        from PIL import Image
+        import io
+        
         with mss.mss() as sct:
             monitor = sct.monitors[1]
             screenshot = sct.grab(monitor)
-            img_data = mss.tools.to_png(screenshot.rgb, screenshot.size)
+            
+            # 转换为 PIL Image
+            img = Image.frombytes('RGB', screenshot.size, screenshot.rgb)
+            
+            # 缩小到 1280px 宽度
+            max_width = 1280
+            if img.width > max_width:
+                ratio = max_width / img.width
+                new_size = (max_width, int(img.height * ratio))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+            
+            # 压缩为 JPEG（更小的文件）
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=85, optimize=True)
+            img_data = buf.getvalue()
+            
             return base64.b64encode(img_data).decode("utf-8")
     
     def map_coordinates(self, x: float, y: float) -> tuple[int, int]:
@@ -200,9 +216,11 @@ class ScreenAgent:
                 "content": [
                     {"type": "text", "text": f"当前任务：{task}\n请分析屏幕并决定下一步操作。"},
                     {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:image/png;base64,{screenshot_base64}"
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/jpeg",
+                            "data": screenshot_base64
                         }
                     }
                 ]
@@ -211,15 +229,72 @@ class ScreenAgent:
             messages = self.conversation_history + [user_message]
             
             print("Sending to AI...")
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=self.max_tokens,
-                temperature=self.temperature
-            )
             
-            ai_response = response.choices[0].message.content
-            print(f"AI response:\n{ai_response}\n")
+            # 构建请求体（使用之前测试成功的格式）
+            headers = {
+                "Content-Type": "application/json",
+                "x-api-key": self.api_key,
+                "anthropic-version": "2023-06-01"
+            }
+            
+            # 构建消息列表（不包含 system）
+            api_messages = []
+            for msg in messages:
+                if msg.get("role") != "system":
+                    api_messages.append(msg)
+            
+            payload = {
+                "model": self.model,
+                "max_tokens": self.max_tokens,
+                "system": system_prompt,
+                "messages": api_messages,
+            }
+            
+            try:
+                # 添加重试机制
+                max_retries = 3
+                last_response = None
+                for retry in range(max_retries):
+                    last_response = httpx.post(
+                        f"{self.base_url}/messages",
+                        json=payload,
+                        headers=headers,
+                        timeout=120
+                    )
+                    
+                    if last_response.status_code == 200:
+                        break
+                    
+                    if last_response.status_code >= 500 and retry < max_retries - 1:
+                        wait_time = 2 ** retry
+                        print(f"API Error: {last_response.status_code}, retrying in {wait_time}s...")
+                        time.sleep(wait_time)
+                        continue
+                    
+                    print(f"API Error: {last_response.status_code}")
+                    print(f"Response: {last_response.text[:300]}")
+                    break
+                
+                if last_response is None or last_response.status_code != 200:
+                    continue
+                
+                data = last_response.json()
+                content_blocks = data.get("content", [])
+                ai_response = ""
+                for block in content_blocks:
+                    if block.get("type") == "text":
+                        ai_response = block.get("text", "")
+                        break
+                
+                if not ai_response:
+                    print("Empty response from API")
+                    continue
+                    
+                print(f"AI response:\n{ai_response}\n")
+                
+            except Exception as e:
+                print(f"API call failed: {e}")
+                continue
             
             self.conversation_history.append(user_message)
             self.conversation_history.append({
